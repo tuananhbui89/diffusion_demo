@@ -166,8 +166,9 @@ def train_inverse(model, sampler, train_data_dir, devices, args):
     """
 
     # create a textual embedding variable to optimize
-    prompt = 'a photo of a person'
+    prompt = f'a photo of {args.concept}'
     emb = model.get_learned_conditioning([prompt])
+    org_emb = emb.clone()
     emb = Variable(emb, requires_grad=True).to(devices[0])
 
     # create an optimizer to optimize the prompt
@@ -206,6 +207,8 @@ def train_inverse(model, sampler, train_data_dir, devices, args):
     
     os.makedirs('evaluation_folder', exist_ok=True)
     os.makedirs('evaluation_folder/textual_inversion', exist_ok=True)
+    os.makedirs(f'evaluation_folder/textual_inversion/{args.concept}', exist_ok=True)
+    os.makedirs(f'{args.models_path}/embedding_textual_inversion', exist_ok=True)
 
     # train the embedding
     for epoch in range(args.epochs):
@@ -217,22 +220,28 @@ def train_inverse(model, sampler, train_data_dir, devices, args):
             # Convert images to latent space
             batch_images = batch['pixel_values'].to(devices[0])
             encoder_posterior = model.encode_first_stage(batch_images)
-            z = model.get_first_stage_encoding(encoder_posterior).detach()
+            batch_z = model.get_first_stage_encoding(encoder_posterior).detach()
 
             # get conditioning - SKIP because in this case, it is the trainable embedding vector
-            cond = emb
+            cond = torch.repeat_interleave(emb, batch_z.shape[0], dim=0)
 
             # random timestep
-            t = torch.randint(0, args.num_timesteps, (batch_images.shape[0],), device=devices[0]).long()
+            t_enc = torch.randint(0, args.ddim_steps, (1,), device=devices[0]).long()
+
+            # time step from 1000 to 0 (0 being good)
+            og_num = round((int(t_enc)/args.ddim_steps)*1000)
+            og_num_lim = round((int(t_enc+1)/args.ddim_steps)*1000)
+
+            t_enc_ddpm = torch.randint(og_num, og_num_lim, (batch_z.shape[0],), device=devices[0])
 
             # add noise
-            noise = torch.randn_like(z) * args.noise_scale
+            noise = torch.randn_like(batch_z) * args.noise_scale
 
             # forward diffusion
-            x_noisy = model.q_sample(x_start=batch_images, t=t, noise=noise)
+            x_noisy = model.q_sample(x_start=batch_z, t=t_enc_ddpm, noise=noise)
 
             # backward diffusion
-            model_output = model.apply_model(x_noisy, t, cond)
+            model_output = model.apply_model(x_noisy, t_enc_ddpm, cond)
 
             # calculate loss
             # in the default setting of Latent Diffusion Models, the output is the epsilon rather than the image
@@ -250,7 +259,12 @@ def train_inverse(model, sampler, train_data_dir, devices, args):
             model.eval()
 
             z_r_till_T = quick_sample_till_t(emb.to(devices[0]), args.start_guidance, fixed_start_code, int(args.ddim_steps))
-            decode_and_save_image(model, z_r_till_T, path=f'evaluation_folder/textual_inversion/gen_{epoch}.png')
+            decode_and_save_image(model, z_r_till_T, path=f'evaluation_folder/textual_inversion/{args.concept}/gen_{epoch}.png')
+
+            z_r_till_T = quick_sample_till_t(org_emb.to(devices[0]), args.start_guidance, fixed_start_code, int(args.ddim_steps))
+            decode_and_save_image(model, z_r_till_T, path=f'evaluation_folder/textual_inversion/{args.concept}/gen_{epoch}_original.png')
+
+            torch.save(emb, f'{args.models_path}/embedding_textual_inversion/emb_{args.concept}_{epoch}.pt')
 
     return emb.detach()
 
@@ -260,10 +274,11 @@ if __name__ == '__main__':
     parser.add_argument('--start_guidance', help='guidance of start image used to train', type=float, required=False, default=3)
     parser.add_argument('--lr', help='learning rate used to train', type=float, required=False, default=1e-5)
     parser.add_argument('--config_path', help='config path for stable diffusion v1-4 inference', type=str, required=False, default='configs/stable-diffusion/v1-inference.yaml')
-    parser.add_argument('--ckpt_path', help='ckpt path for stable diffusion v1-4', type=str, required=False, default='models/ldm/stable-diffusion-v1/sd-v1-4-full-ema.ckpt')
+    parser.add_argument('--ckpt_path', help='ckpt path for stable diffusion v1-4', type=str, required=False, default='../Better_Erasing/models/erase/sd-v1-4-full-ema.ckpt')
     parser.add_argument('--devices', help='cuda devices to train on', type=str, required=False, default='0,0')
     parser.add_argument('--image_size', help='image size used to train', type=int, required=False, default=512)
     parser.add_argument('--ddim_steps', help='ddim steps of inference used to train', type=int, required=False, default=50)
+    parser.add_argument('--ddim_eta', help='ddim eta used to train', type=float, required=False, default=0.0)
     parser.add_argument('--info', help='info to add to model name', type=str, required=False, default='')
 
     parser.add_argument('--models_path', help='path to save output model', type=str, required=True, default='models')
@@ -274,8 +289,7 @@ if __name__ == '__main__':
     parser.add_argument('--train_batch_size', help='batch size for training', type=int, required=False, default=4)
     parser.add_argument('--dataloader_num_workers', help='number of workers for dataloader', type=int, required=False, default=4)
     parser.add_argument('--epochs', help='number of epochs to train', type=int, required=False, default=10)
-    parser.add_argument('--noise_scale', help='noise scale for training', type=float, required=False, default=0.01)
-    parser.add_argument('--num_timesteps', help='number of timesteps for training', type=int, required=False, default=100)
+    parser.add_argument('--noise_scale', help='noise scale for training', type=float, required=False, default=1.0)
     parser.add_argument('--verbose', help='whether to print verbose', type=bool, required=False, default=True)
 
 
@@ -291,5 +305,6 @@ if __name__ == '__main__':
     emb = train_inverse(model, sampler, args.train_data_dir, devices, args)
 
     # save the learned embedding
-    torch.save(emb, f'{args.models_path}/emb_{args.concept}.pt')
+    os.makedirs(f'{args.models_path}/embedding_textual_inversion', exist_ok=True)
+    torch.save(emb, f'{args.models_path}/embedding_textual_inversion/emb_{args.concept}.pt')
 
